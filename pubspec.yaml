@@ -7,6 +7,7 @@ environment:
   sdk: '>=3.4.4 <4.0.0'
 
 dependencies:
+  crypto: ^3.0.6
   flutter:
     sdk: flutter
   flutter_secure_storage: ^9.2.2
@@ -15,6 +16,7 @@ dependencies:
   http: ^1.2.2
   oidc: ^0.7.0
   oidc_default_store: ^0.2.0+9
+  openid_client: ^0.4.8
 
 dev_dependencies:
   flutter_lints: ^3.0.0
