@@ -1,31 +1,46 @@
 import 'dart:convert';
 import 'dart:math';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:http/http.dart' as http;
 import 'package:oidc/oidc.dart';
 import 'package:oidc_default_store/oidc_default_store.dart';
 
-final zitadelIssuer = Uri.parse('https://public-3dvddc.zitadel.cloud');
+// URL de ZITADEL + ID de cliente
 const zitadelClientId = '292333157821289794';
+final zitadelIssuer = Uri.parse('https://public-3dvddc.zitadel.cloud');
 const callbackUrlScheme = 'com.example.flutterapp';
-final storage = FlutterSecureStorage();
 
-/// Configuración del OidcUserManager para manejar los tokens y la autenticación.
+/// This will be the current url of the page + /auth.html added to it.
+final baseUri = Uri.base;
+final webCallbackUrl = Uri.base.replace(path: 'auth.html');
+
+/// for web platforms, we use http://website-url.com/auth.html
+/// for mobile platforms, we use `com.example.flutterapp:/auth`
+final redirectUri =
+    kIsWeb ? webCallbackUrl : Uri(scheme: callbackUrlScheme, path: '/auth');
+
 final userManager = OidcUserManager.lazy(
   discoveryDocumentUri: OidcUtils.getOpenIdConfigWellKnownUri(zitadelIssuer),
-  clientCredentials: const OidcClientAuthentication.none(clientId: zitadelClientId),
+  clientCredentials:
+      const OidcClientAuthentication.none(clientId: zitadelClientId),
   store: OidcDefaultStore(),
   settings: OidcUserManagerSettings(
-    redirectUri: Uri(scheme: callbackUrlScheme, path: '/auth'),
-    postLogoutRedirectUri: Uri(scheme: callbackUrlScheme, path: '/auth'),
+    redirectUri: redirectUri,
+    postLogoutRedirectUri: redirectUri,
     scope: ['openid', 'profile', 'email', 'offline_access'],
   ),
 );
 
+final _secureStorage = FlutterSecureStorage();
+late Future<void> initFuture;
+
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  initFuture = userManager.init();
   runApp(const MyApp());
 }
 
@@ -35,10 +50,28 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter ZITADEL Authentication',
+      title: 'Flutter ZITADEL Demo',
       theme: ThemeData(
         primarySwatch: Colors.blue,
       ),
+      builder: (context, child) {
+        return FutureBuilder(
+          future: initFuture,
+          builder: (context, snapshot) {
+            if (snapshot.hasError) {
+              return ErrorWidget(snapshot.error.toString());
+            }
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Material(
+                child: Center(
+                  child: CircularProgressIndicator.adaptive(),
+                ),
+              );
+            }
+            return child!;
+          },
+        );
+      },
       home: const MyHomePage(title: 'Flutter ZITADEL Quickstart'),
     );
   }
@@ -56,21 +89,40 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   bool _busy = false;
   Object? latestError;
-  String? accessToken;
-  String? idToken;
 
-  /// Función para generar un code_verifier aleatorio
-  String _generateCodeVerifier() {
-    final random = Random.secure();
-    final values = List<int>.generate(32, (_) => random.nextInt(256));
-    return base64Url.encode(values).replaceAll('=', '');
+  /// Test if there is a logged in user.
+  bool get _authenticated => _currentUser != null;
+
+  /// To get the access token.
+  String? get accessToken => _currentUser?.token.accessToken;
+
+  /// To get the id token.
+  String? get idToken => _currentUser?.idToken;
+
+  /// To access the claims.
+  String? get _username {
+    final currentUser = _currentUser;
+    if (currentUser == null) {
+      return null;
+    }
+    final claims = currentUser.aggregatedClaims;
+    return '${claims['given_name']} ${claims['family_name']}';
   }
 
-  /// Función para generar el code_challenge a partir del code_verifier
-  String _generateCodeChallenge(String codeVerifier) {
+  OidcUser? get _currentUser => userManager.currentUser;
+
+  // Generar code_verifier
+  String generateCodeVerifier() {
+    final rand = Random.secure();
+    final codeVerifier = List<int>.generate(128, (index) => rand.nextInt(256));
+    return base64UrlEncode(codeVerifier).replaceAll('=', '');
+  }
+
+  // Generar code_challenge desde el code_verifier
+  String generateCodeChallenge(String codeVerifier) {
     final bytes = utf8.encode(codeVerifier);
     final digest = sha256.convert(bytes);
-    return base64Url.encode(digest.bytes).replaceAll('=', '');
+    return base64UrlEncode(digest.bytes).replaceAll('=', '');
   }
 
   Future<void> _authenticate() async {
@@ -78,86 +130,53 @@ class _MyHomePageState extends State<MyHomePage> {
       latestError = null;
       _busy = true;
     });
-
     try {
-      // Asegúrate de inicializar userManager antes de usarlo
-      await userManager.init();
+      final codeVerifier = generateCodeVerifier();
+      final codeChallenge = generateCodeChallenge(codeVerifier);
 
-      // Generar el code_verifier y el code_challenge para PKCE
-      final codeVerifier = _generateCodeVerifier();
-      final codeChallenge = _generateCodeChallenge(codeVerifier);
-
-      // Construir la URL de autenticación con PKCE
-      final discoveryDocument = await userManager.discoveryDocument;
-      final authorizationEndpoint = discoveryDocument.authorizationEndpoint;
-      final authorizationUrl = Uri(
-        scheme: authorizationEndpoint?.scheme,
-        host: authorizationEndpoint?.host,
-        path: authorizationEndpoint?.path,
-        queryParameters: {
-          'client_id': zitadelClientId,
-          'redirect_uri': '$callbackUrlScheme:/auth',
-          'response_type': 'code',
-          'scope': 'openid profile email offline_access',
-          'code_challenge': codeChallenge,
-          'code_challenge_method': 'S256',
-        },
-      ).toString();
-
-      // Abrir el navegador para autenticar usando FlutterWebAuth2
-      final resultUrl = await FlutterWebAuth2.authenticate(
-        url: authorizationUrl,
+      // Llamada a login con flutter_web_auth_2 para iniciar el flujo de autenticación
+      final result = await FlutterWebAuth2.authenticate(
+        url: "${zitadelIssuer.toString()}/oauth/v2/authorize?client_id=$zitadelClientId&redirect_uri=$redirectUri&response_type=code&scope=openid%20profile%20email%20offline_access&code_challenge=$codeChallenge&code_challenge_method=S256",
         callbackUrlScheme: callbackUrlScheme,
       );
 
-      // Extraer el código de autorización de la URL de redirección
-      final uri = Uri.parse(resultUrl);
-      final authCode = uri.queryParameters['code'];
-      if (authCode == null) {
-        throw Exception("No se recibió ningún código de autorización.");
+      // Obtiene el código de autorización desde el resultado de la autenticación
+      final code = Uri.parse(result).queryParameters['code'];
+      if (code == null) {
+        throw Exception("No authorization code returned");
       }
 
-      // Intercambiar el código de autorización por tokens
-      final tokenUrl = Uri.parse('${zitadelIssuer.toString()}/oauth/v2/token');
+      // Solicita el token de acceso utilizando el código de autorización
       final response = await http.post(
-        tokenUrl,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
+        Uri.parse('${zitadelIssuer.toString()}/oauth/v2/token'),
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: {
-          'client_id': zitadelClientId,
           'grant_type': 'authorization_code',
-          'code': authCode,
-          'redirect_uri': '$callbackUrlScheme:/auth',
-          'code_verifier': codeVerifier,
+          'client_id': zitadelClientId,
+          'code': code,
+          'redirect_uri': redirectUri.toString(),
+          'code_verifier': codeVerifier, // Usa el code_verifier para verificar el token
         },
       );
 
       if (response.statusCode == 200) {
         final tokenData = json.decode(response.body);
-        accessToken = tokenData['access_token'];
-        idToken = tokenData['id_token'];
-        final refreshToken = tokenData['refresh_token'];
-
-        // Guardar los tokens en almacenamiento seguro
-        await storage.write(key: 'access_token', value: accessToken);
-        await storage.write(key: 'id_token', value: idToken);
-        await storage.write(key: 'refresh_token', value: refreshToken);
-
-        print("Access Token: $accessToken");
-        print("ID Token: $idToken");
-        print("Refresh Token: $refreshToken");
+        await _secureStorage.write(key: 'access_token', value: tokenData['access_token']);
+        await _secureStorage.write(key: 'refresh_token', value: tokenData['refresh_token']);
       } else {
-        throw Exception("Error al intercambiar el código de autorización: ${response.body}");
+        print('Failed to retrieve access token: ${response.statusCode} - ${response.body}');
+        throw Exception("Failed to retrieve access token");
       }
     } catch (e) {
-      latestError = e;
-      print("Error durante la autenticación: $e");
+      print(e);
+      setState(() {
+        latestError = e;
+      });
+    } finally {
+      setState(() {
+        _busy = false;
+      });
     }
-
-    setState(() {
-      _busy = false;
-    });
   }
 
   Future<void> _logout() async {
@@ -166,17 +185,36 @@ class _MyHomePageState extends State<MyHomePage> {
       _busy = true;
     });
     try {
-      await storage.delete(key: 'access_token');
-      await storage.delete(key: 'id_token');
-      await storage.delete(key: 'refresh_token');
-      accessToken = null;
-      idToken = null;
+      await userManager.logout();
+      await _secureStorage.delete(key: 'access_token');
+      await _secureStorage.delete(key: 'refresh_token');
     } catch (e) {
       latestError = e;
+    } finally {
+      setState(() {
+        _busy = false;
+      });
     }
-    setState(() {
-      _busy = false;
-    });
+  }
+
+  Future<bool> _isAuthenticated() async {
+    final token = await _secureStorage.read(key: 'access_token');
+    return token != null;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _checkAuthenticationStatus();
+  }
+
+  Future<void> _checkAuthenticationStatus() async {
+    bool isAuthenticated = await _isAuthenticated();
+    if (isAuthenticated) {
+      setState(() {
+        _busy = false;
+      });
+    }
   }
 
   @override
@@ -186,56 +224,63 @@ class _MyHomePageState extends State<MyHomePage> {
         title: Text(widget.title),
       ),
       body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            if (latestError != null)
-              Text(
-                "Error: $latestError",
-                style: const TextStyle(color: Colors.red),
-              )
-            else if (_busy)
-              const Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Text("Iniciando sesión..."),
-                  Padding(
-                    padding: EdgeInsets.all(16.0),
-                    child: CircularProgressIndicator(),
-                  ),
-                ],
-              )
-            else if (accessToken != null) ...[
-              Text(
-                '¡Autenticado!',
-              ),
-              Text(
-                'Access Token: $accessToken',
-              ),
-              Text(
-                'ID Token: $idToken',
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 16.0),
-                child: ElevatedButton(
-                  onPressed: _logout,
-                  child: const Text('Cerrar sesión'),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (latestError != null)
+                Text('Error: $latestError')
+              else if (_busy)
+                const Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text("Busy, logging in."),
+                    Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: CircularProgressIndicator(),
+                    ),
+                  ],
+                )
+              else ...[
+                FutureBuilder<bool>(
+                  future: _isAuthenticated(),
+                  builder: (context, snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return CircularProgressIndicator();
+                    }
+                    if (snapshot.hasData && snapshot.data!) {
+                      return Column(
+                        children: [
+                          Text('Hello $_username!'),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 16.0),
+                            child: ElevatedButton(
+                              onPressed: _logout,
+                              child: const Text('Logout'),
+                            ),
+                          ),
+                        ],
+                      );
+                    } else {
+                      return Column(
+                        children: [
+                          const Text('You are not authenticated.'),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 16.0),
+                            child: ElevatedButton.icon(
+                              icon: const Icon(Icons.fingerprint),
+                              label: const Text('Login'),
+                              onPressed: _authenticate,
+                            ),
+                          ),
+                        ],
+                      );
+                    }
+                  },
                 ),
-              ),
-            ] else ...[
-              const Text(
-                'No estás autenticado.',
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 16.0),
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.fingerprint),
-                  label: const Text('Iniciar sesión'),
-                  onPressed: _authenticate,
-                ),
-              ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
