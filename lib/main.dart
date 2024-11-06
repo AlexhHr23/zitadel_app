@@ -5,12 +5,11 @@ import 'dart:math';
 import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
-const zitadelClientId = '291785825778214944';
-final zitadelIssuer = Uri.parse('https://fire-bhwnnt.us1.zitadel.cloud');
+const zitadelClientId = '292333157821289794';
+final zitadelIssuer = Uri.parse('https://public-3dvddc.zitadel.cloud');
 const callbackUrlScheme = 'com.example.flutterapp';
 const userInfoEndpoint =
-    'https://fire-bhwnnt.us1.zitadel.cloud/oidc/v1/userinfo';
-
+    'https://public-3dvddc.zitadel.cloud/oidc/v1/userinfo';
 
 void main() {
   runApp(const MyApp());
